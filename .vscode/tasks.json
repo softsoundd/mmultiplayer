@@ -13,7 +13,7 @@
 			],
 			"options": {
 				"env": {
-					"PATH": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\MSBuild\\Current\\Bin"
+					"PATH": "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\MSBuild\\Current\\Bin"
 				}
 			},
 			"type": "shell",
@@ -32,7 +32,7 @@
 			],
 			"options": {
 				"env": {
-					"PATH": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\MSBuild\\Current\\Bin"
+					"PATH": "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\MSBuild\\Current\\Bin"
 				}
 			},
 			"type": "shell",

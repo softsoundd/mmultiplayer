@@ -1,31 +1,15 @@
-## How to create a release
+# Contributing
 
-1. Go to GitHub releases
-2. Create a new release
-3. Create new tag with version #
-4. Wait for CI to finish
+## Building the Client and Launcher
 
-## Building from source
+- When working with VSCode, a build task is included
+- Alternatively, run `./build.sh` using Git Bash. Requires DirectX June 2010 and MSBuild
 
-To build dll and Launcher:
-- `./build.sh` - Requires DirectX June 2010, MSBuild, Visual Studio 2019 and Git Bash.
+## Building the Installer
 
-To build the installer:
-- `VERSION=X.X.X ./package.sh` - Expects a version to be provided by setting an environment variable. Saves and builds artifacts to `build/`. Requires Golang, Inno Setup, and Git Bash.
+- Run `VERSION=X.X.X ./package.sh` using Git Bash. Expects a version to be provided via an environment variable. Builds artifacts into `build/`. Requires Go and Inno Setup.
 
 ## Troubleshooting
 
-- `%localappdata%\Temp` - Installer logs are saved in here. E.g., `Setup Log 2023-07-13 #010.txt`
-  and `mirrors-edge-multiplayer-installer-helper-*.log`
-- `Get-MpThreatDetection` - Run this command in Windows PowerShell to get Windows Defender threat history to see if any of the multiplayer files were affected. 
-
-## Contributors
-
-Thanks to these wonderful people :)
-
-- [btbd](https://github.com/btbd)
-- [LucasOe](https://github.com/LucasOe)
-- [Toyro98](https://github.com/Toyro98)
-- [Meteos](https://github.com/masoukaze)
-- [SeungKang](https://github.com/SeungKang)
-- [stephen-fox](https://github.com/stephen-fox)
+- Installer logs are saved in `%localappdata%\Temp`. E.g., `Setup Log 2023-07-13 #010.txt` and `mirrors-edge-multiplayer-installer-helper-*.log`
+- Run `Get-MpThreatDetection` in Windows PowerShell to get Windows Defender threat history to see if any of the multiplayer files were affected.
