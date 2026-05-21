@@ -111,6 +111,9 @@ static void ImGui_ImplDX9_SetupRenderState(ImDrawData* draw_data)
     bd->pd3dDevice->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
     bd->pd3dDevice->SetRenderState(D3DRS_STENCILENABLE, FALSE);
     bd->pd3dDevice->SetRenderState(D3DRS_CLIPPING, TRUE);
+    bd->pd3dDevice->SetRenderState(D3DRS_COLORWRITEENABLE,
+        D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN |
+        D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
     bd->pd3dDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
     bd->pd3dDevice->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
     bd->pd3dDevice->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
