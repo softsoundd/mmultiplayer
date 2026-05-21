@@ -84,6 +84,7 @@ void OnInput(InputCallback callback);
 void OnSuperInput(InputCallback callback);
 
 void BlockInput(bool block);
+bool InitializeD3D();
 bool Initialize();
 
 } // namespace Engine
