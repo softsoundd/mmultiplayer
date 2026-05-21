@@ -1,6 +1,7 @@
 #include <windows.h>
 
 #include "debug.h"
+#include "engine.h"
 #include "menu.h"
 #include "settings.h"
 #include "addon.h"
@@ -12,12 +13,10 @@
 #include "addons/chaos/chaos.h"
 
 DWORD WINAPI InitThread(LPVOID param) {
-    // Wait for D3D9 to be fully loaded
-    while (!GetModuleHandle(L"d3d9.dll")) {
-        Sleep(100);
+    if (!Engine::InitializeD3D()) {
+        MessageBoxA(nullptr, "Failed to initialize D3D hooks", "Fatal", 0);
+        return 0;
     }
-    
-    Sleep(100);
 
     Settings::Load();
 

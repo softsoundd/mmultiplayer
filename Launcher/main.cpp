@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include <Psapi.h>
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, char *, int) {
@@ -24,11 +24,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, char *, int) {
         if (HasModule(process, L"mmultiplayer.dll")) {
             CloseHandle(process);
             return 0;
-        }
-
-        if (!HasModule(process, L"openal32.dll")) {
-            CloseHandle(process);
-            continue;
         }
 
         TerminateThread(thread, 0);

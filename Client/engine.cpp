@@ -1,4 +1,5 @@
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "engine.h"
@@ -15,6 +16,7 @@
 // D3D9 and window hooks
 static struct {
     std::vector<RenderSceneCallback> Callbacks;
+    bool ImGuiInitialized = false;
     HRESULT(WINAPI *Original)(IDirect3DDevice9 *) = nullptr;
 } renderScene;
 
@@ -35,6 +37,26 @@ static struct {
 } window;
 
 static HMODULE(WINAPI *LoadLibraryAOriginal)(const char *) = nullptr;
+static HMODULE(WINAPI *LoadLibraryWOriginal)(LPCWSTR) = nullptr;
+static HMODULE(WINAPI *LoadLibraryExWOriginal)(LPCWSTR, HANDLE, DWORD) = nullptr;
+
+typedef IDirect3D9 *(WINAPI *Direct3DCreate9Fn)(UINT);
+typedef HRESULT(WINAPI *D3D9CreateDeviceFn)(IDirect3D9 *, UINT, D3DDEVTYPE, HWND,
+                                            DWORD, D3DPRESENT_PARAMETERS *,
+                                            IDirect3DDevice9 **);
+
+static Direct3DCreate9Fn Direct3DCreate9Original = nullptr;
+static D3D9CreateDeviceFn CreateDeviceOriginal = nullptr;
+
+static std::recursive_mutex d3dHookMutex;
+static bool moduleHooksInstalled = false;
+static bool direct3DCreate9Hooked = false;
+static bool createDeviceHooked = false;
+static bool endSceneHooked = false;
+static bool resetHooked = false;
+static bool renderHooksInstalled = false;
+static bool fallbackProbeStarted = false;
+static thread_local bool d3dProbeSuppressed = false;
 
 // Engine hooks
 static struct {
@@ -99,25 +121,49 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 // D3D9 and window hook implementations
 LRESULT CALLBACK WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static HWND ResolveDeviceWindow(IDirect3DDevice9 *device,
+                                D3DPRESENT_PARAMETERS *params = nullptr);
+static bool InstallD3DFactoryHook(HMODULE module);
+static bool InstallCreateDeviceHook(IDirect3D9 *d3d9);
+static bool InstallDeviceHooks(IDirect3DDevice9 *device);
+static void HandleLoadedModule(HMODULE module);
+static void PrepareMenlHooksForLoad();
+static void StartFallbackProbe();
+static bool IsD3D9ModuleName(const char *module);
+static bool IsD3D9ModuleName(LPCWSTR module);
+static bool IsMenlModuleName(const char *module);
+static bool IsMenlModuleName(LPCWSTR module);
+IDirect3D9 *WINAPI Direct3DCreate9Hook(UINT sdkVersion);
+HRESULT WINAPI CreateDeviceHook(IDirect3D9 *d3d9, UINT adapter, D3DDEVTYPE deviceType,
+                                HWND focusWindow, DWORD behaviorFlags,
+                                D3DPRESENT_PARAMETERS *presentationParameters,
+                                IDirect3DDevice9 **returnedDevice);
+
 HRESULT WINAPI EndSceneHook(IDirect3DDevice9 *device) {
-    static bool init = true;
-    if (init) {
-        D3DDEVICE_CREATION_PARAMETERS params;
-        device->GetCreationParameters(&params);
+    if (!renderScene.ImGuiInitialized) {
+        const auto gameWindow = ResolveDeviceWindow(device);
+        if (!gameWindow) {
+            return renderScene.Original(device);
+        }
 
         ImGui::CreateContext();
-        ImGui::GetIO().Fonts->AddFontFromFileTTF(
-            "C:\\Windows\\Fonts\\verdana.ttf", 16.0f);
+        if (GetFileAttributesA("C:\\Windows\\Fonts\\verdana.ttf") != INVALID_FILE_ATTRIBUTES) {
+            ImGui::GetIO().Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\verdana.ttf", 16.0f);
+        } else {
+            ImGui::GetIO().Fonts->AddFontDefault();
+        }
 
-        window.Window = params.hFocusWindow;
-        ImGui_ImplWin32_Init(params.hFocusWindow);
+        window.Window = gameWindow;
+        ImGui_ImplWin32_Init(gameWindow);
         ImGui_ImplDX9_Init(device);
 
+        SetLastError(0);
         window.WndProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtr(params.hFocusWindow, GWLP_WNDPROC,
-                             reinterpret_cast<LONG>(WndProcHook)));
+            SetWindowLongPtr(gameWindow, GWLP_WNDPROC,
+                             reinterpret_cast<LONG_PTR>(WndProcHook)));
 
-        init = false;
+        renderScene.ImGuiInitialized = true;
+        ImGui::GetIO().MouseDrawCursor = window.BlockInput;
     }
 
     ImGui_ImplDX9_NewFrame();
@@ -130,12 +176,6 @@ HRESULT WINAPI EndSceneHook(IDirect3DDevice9 *device) {
 
     ImGui::EndFrame();
 
-    device->SetRenderState(D3DRS_ZENABLE, false);
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, false);
-    device->SetRenderState(D3DRS_SCISSORTESTENABLE, false);
-    device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-                  D3DCOLOR_RGBA(0, 0, 0, 0), 1.0f, 0);
-
     ImGui::Render();
     ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
 
@@ -145,14 +185,19 @@ HRESULT WINAPI EndSceneHook(IDirect3DDevice9 *device) {
 HRESULT WINAPI ResetHook(IDirect3DDevice9 *pDevice,
                          D3DPRESENT_PARAMETERS *params) {
 
-    ImGui_ImplDX9_Shutdown();
-    ImGui_ImplWin32_Shutdown();
+    if (renderScene.ImGuiInitialized) {
+        ImGui_ImplDX9_InvalidateDeviceObjects();
+    }
 
     const auto ret = resetScene.Original(pDevice, params);
 
-    window.Window = params->hDeviceWindow;
-    ImGui_ImplWin32_Init(params->hDeviceWindow);
-    ImGui_ImplDX9_Init(pDevice);
+    if (SUCCEEDED(ret) && renderScene.ImGuiInitialized) {
+        const auto gameWindow = ResolveDeviceWindow(pDevice, params);
+        if (gameWindow) {
+            window.Window = gameWindow;
+        }
+        ImGui_ImplDX9_CreateDeviceObjects();
+    }
 
     return ret;
 }
@@ -209,14 +254,15 @@ void HandleMessage(HWND hWnd, UINT &msg, WPARAM wParam, LPARAM lParam) {
 LRESULT CALLBACK WndProcHook(HWND hWnd, UINT msg, WPARAM wParam,
                              LPARAM lParam) {
 
-    if (window.BlockInput &&
+    if (window.BlockInput && renderScene.ImGuiInitialized &&
         ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) {
         HandleMessage(hWnd, msg, wParam, lParam);
         return true;
     }
 
     HandleMessage(hWnd, msg, wParam, lParam);
-    return CallWindowProc(window.WndProc, hWnd, msg, wParam, lParam);
+    return window.WndProc ? CallWindowProc(window.WndProc, hWnd, msg, wParam, lParam)
+                          : DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
 BOOL WINAPI PeekMessageHook(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin,
@@ -227,8 +273,10 @@ BOOL WINAPI PeekMessageHook(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin,
 
     if (lpMsg && (wRemoveMsg & PM_REMOVE)) {
         if (window.BlockInput) {
-            ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message,
-                                           lpMsg->wParam, lpMsg->lParam);
+            if (renderScene.ImGuiInitialized) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message,
+                                               lpMsg->wParam, lpMsg->lParam);
+            }
 
             HandleMessage(lpMsg->hwnd, lpMsg->message, lpMsg->wParam,
                           lpMsg->lParam);
@@ -309,36 +357,405 @@ int PostDeathHook() {
     return ret;
 }
 
-HMODULE WINAPI LoadLibraryAHook(const char *module) {
-    if (strstr(module, "menl_hooks.dll")) {
-        Hook::UnTrampolineHook(levelLoad.Base, levelLoad.Original);
-        Hook::UnTrampolineHook(death.PreBase, death.PreOriginal);
-        Hook::UnTrampolineHook(death.PostBase, death.PostOriginal);
-
-        std::thread([]() {
-            for (;;) {
-                if (*reinterpret_cast<byte *>(death.PostBase) == 0xE9) {
-                    Hook::TrampolineHook(
-                        LevelLoadHook, levelLoad.Base,
-                        reinterpret_cast<void **>(&levelLoad.Original));
-
-                    Hook::TrampolineHook(
-                        PreDeathHook, death.PreBase,
-                        reinterpret_cast<void **>(&death.PreOriginal));
-
-                    Hook::TrampolineHook(
-                        PostDeathHook, death.PostBase,
-                        reinterpret_cast<void **>(&death.PostOriginal));
-
-                    return;
-                }
-
-                Sleep(1);
-            }
-        }).detach();
+static BOOL CALLBACK FindGameWindowProc(HWND hwnd, LPARAM lParam) {
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hwnd, &processId);
+    if (processId != GetCurrentProcessId() || !IsWindowVisible(hwnd)) {
+        return TRUE;
     }
 
-    return LoadLibraryAOriginal(module);
+    *reinterpret_cast<HWND *>(lParam) = hwnd;
+    return FALSE;
+}
+
+static HWND FindGameWindow() {
+    HWND hwnd = nullptr;
+    EnumWindows(FindGameWindowProc, reinterpret_cast<LPARAM>(&hwnd));
+    return hwnd;
+}
+
+static HWND ResolveDeviceWindow(IDirect3DDevice9 *device,
+                                D3DPRESENT_PARAMETERS *params) {
+    if (params && IsWindow(params->hDeviceWindow)) {
+        return params->hDeviceWindow;
+    }
+
+    D3DDEVICE_CREATION_PARAMETERS creationParams;
+    if (device && SUCCEEDED(device->GetCreationParameters(&creationParams)) &&
+        IsWindow(creationParams.hFocusWindow)) {
+        return creationParams.hFocusWindow;
+    }
+
+    const auto foreground = GetForegroundWindow();
+    DWORD processId = 0;
+    if (foreground) {
+        GetWindowThreadProcessId(foreground, &processId);
+        if (processId == GetCurrentProcessId()) {
+            return foreground;
+        }
+    }
+
+    return FindGameWindow();
+}
+
+static const char *GetBaseName(const char *module) {
+    if (!module) {
+        return nullptr;
+    }
+
+    const char *slash = strrchr(module, '\\');
+    const char *forwardSlash = strrchr(module, '/');
+    const char *base = slash;
+    if (!base || (forwardSlash && forwardSlash > base)) {
+        base = forwardSlash;
+    }
+    return base ? base + 1 : module;
+}
+
+static const wchar_t *GetBaseName(LPCWSTR module) {
+    if (!module) {
+        return nullptr;
+    }
+
+    const wchar_t *slash = wcsrchr(module, L'\\');
+    const wchar_t *forwardSlash = wcsrchr(module, L'/');
+    const wchar_t *base = slash;
+    if (!base || (forwardSlash && forwardSlash > base)) {
+        base = forwardSlash;
+    }
+    return base ? base + 1 : module;
+}
+
+static bool IsD3D9ModuleName(const char *module) {
+    const auto base = GetBaseName(module);
+    return base && _stricmp(base, "d3d9.dll") == 0;
+}
+
+static bool IsD3D9ModuleName(LPCWSTR module) {
+    const auto base = GetBaseName(module);
+    return base && _wcsicmp(base, L"d3d9.dll") == 0;
+}
+
+static bool IsMenlModuleName(const char *module) {
+    const auto base = GetBaseName(module);
+    return base && _stricmp(base, "menl_hooks.dll") == 0;
+}
+
+static bool IsMenlModuleName(LPCWSTR module) {
+    const auto base = GetBaseName(module);
+    return base && _wcsicmp(base, L"menl_hooks.dll") == 0;
+}
+
+static void PrepareMenlHooksForLoad() {
+    if (!levelLoad.Base || !levelLoad.Original || !death.PreBase ||
+        !death.PreOriginal || !death.PostBase || !death.PostOriginal) {
+        return;
+    }
+
+    Hook::UnTrampolineHook(levelLoad.Base, levelLoad.Original);
+    Hook::UnTrampolineHook(death.PreBase, death.PreOriginal);
+    Hook::UnTrampolineHook(death.PostBase, death.PostOriginal);
+
+    std::thread([]() {
+        for (;;) {
+            if (death.PostBase && *reinterpret_cast<byte *>(death.PostBase) == 0xE9) {
+                Hook::TrampolineHook(LevelLoadHook, levelLoad.Base,
+                                     reinterpret_cast<void **>(&levelLoad.Original));
+
+                Hook::TrampolineHook(PreDeathHook, death.PreBase,
+                                     reinterpret_cast<void **>(&death.PreOriginal));
+
+                Hook::TrampolineHook(PostDeathHook, death.PostBase,
+                                     reinterpret_cast<void **>(&death.PostOriginal));
+
+                return;
+            }
+
+            Sleep(1);
+        }
+    }).detach();
+}
+
+static void HandleLoadedModule(HMODULE module) {
+    if (!module) {
+        return;
+    }
+
+    InstallD3DFactoryHook(module);
+}
+
+static bool InstallDeviceHooks(IDirect3DDevice9 *device) {
+    if (!device) {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(d3dHookMutex);
+    void **vtable = *reinterpret_cast<void ***>(device);
+    bool status = true;
+
+    if (!endSceneHooked) {
+        const bool endSceneStatus = Hook::TrampolineHook(
+            EndSceneHook, vtable[D3D9_EXPORT_ENDSCENE],
+            reinterpret_cast<void **>(&renderScene.Original));
+        endSceneHooked = endSceneStatus;
+        status = status && endSceneStatus;
+    }
+
+    if (!resetHooked) {
+        const bool resetStatus = Hook::TrampolineHook(
+            ResetHook, vtable[D3D9_EXPORT_RESET],
+            reinterpret_cast<void **>(&resetScene.Original));
+        resetHooked = resetStatus;
+        status = status && resetStatus;
+    }
+
+    renderHooksInstalled = endSceneHooked && resetHooked;
+    return renderHooksInstalled;
+}
+
+static bool InstallCreateDeviceHook(IDirect3D9 *d3d9) {
+    if (!d3d9) {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(d3dHookMutex);
+    if (createDeviceHooked) {
+        return true;
+    }
+
+    static const auto D3D9_EXPORT_CREATEDEVICE = 16;
+    void **vtable = *reinterpret_cast<void ***>(d3d9);
+    createDeviceHooked = Hook::TrampolineHook(
+        CreateDeviceHook, vtable[D3D9_EXPORT_CREATEDEVICE],
+        reinterpret_cast<void **>(&CreateDeviceOriginal));
+
+    return createDeviceHooked;
+}
+
+static bool InstallD3DFactoryHook(HMODULE module) {
+    std::lock_guard<std::recursive_mutex> lock(d3dHookMutex);
+    if (direct3DCreate9Hooked) {
+        StartFallbackProbe();
+        return true;
+    }
+
+    auto create9 = reinterpret_cast<Direct3DCreate9Fn>(
+        GetProcAddress(module, "Direct3DCreate9"));
+    if (!create9) {
+        return false;
+    }
+
+    direct3DCreate9Hooked = Hook::TrampolineHook(
+        Direct3DCreate9Hook, reinterpret_cast<void *>(create9),
+        reinterpret_cast<void **>(&Direct3DCreate9Original));
+
+    if (direct3DCreate9Hooked) {
+        StartFallbackProbe();
+    }
+
+    return direct3DCreate9Hooked;
+}
+
+struct D3DProbeGuard {
+    bool Previous;
+
+    D3DProbeGuard() {
+        Previous = d3dProbeSuppressed;
+        d3dProbeSuppressed = true;
+    }
+
+    ~D3DProbeGuard() {
+        d3dProbeSuppressed = Previous;
+    }
+};
+
+static HRESULT TryCreateProbeDevice(IDirect3D9 *d3d9, HWND window,
+                                    IDirect3DDevice9 **device) {
+    D3DPRESENT_PARAMETERS d3dpp;
+    ZeroMemory(&d3dpp, sizeof(d3dpp));
+    d3dpp.Windowed = TRUE;
+    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    d3dpp.BackBufferFormat = D3DFMT_UNKNOWN;
+    d3dpp.BackBufferWidth = 1;
+    d3dpp.BackBufferHeight = 1;
+    d3dpp.hDeviceWindow = nullptr;
+
+    struct ProbeAttempt {
+        D3DDEVTYPE Type;
+        HWND Window;
+    } attempts[] = {
+        {D3DDEVTYPE_HAL, nullptr},
+        {D3DDEVTYPE_HAL, window},
+        {D3DDEVTYPE_REF, window},
+        {D3DDEVTYPE_REF, nullptr},
+    };
+
+    HRESULT hr = D3DERR_NOTAVAILABLE;
+    for (const auto &attempt : attempts) {
+        d3dpp.hDeviceWindow = attempt.Window;
+        hr = d3d9->CreateDevice(D3DADAPTER_DEFAULT, attempt.Type,
+                                d3dpp.hDeviceWindow,
+                                D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp,
+                                device);
+        if (SUCCEEDED(hr) && *device) {
+            return hr;
+        }
+    }
+
+    return hr;
+}
+
+static bool TryFallbackProbe() {
+    auto module = GetModuleHandleW(L"d3d9.dll");
+    if (!module) {
+        return false;
+    }
+
+    if (!direct3DCreate9Hooked) {
+        InstallD3DFactoryHook(module);
+    }
+
+    auto create9 = Direct3DCreate9Original;
+    if (!create9) {
+        create9 = reinterpret_cast<Direct3DCreate9Fn>(
+            GetProcAddress(module, "Direct3DCreate9"));
+    }
+
+    if (!create9) {
+        return false;
+    }
+
+    D3DProbeGuard guard;
+    IDirect3D9 *d3d9 = create9(D3D_SDK_VERSION);
+    if (!d3d9) {
+        return false;
+    }
+
+    InstallCreateDeviceHook(d3d9);
+
+    const wchar_t className[] = L"MMultiplayerD3DProbeWindow";
+    WNDCLASSEXW wc = {sizeof(WNDCLASSEXW), CS_CLASSDC, DefWindowProcW, 0L, 0L,
+                      GetModuleHandle(nullptr), nullptr, nullptr, nullptr,
+                      nullptr, className, nullptr};
+    const bool registeredByUs = RegisterClassExW(&wc) != 0;
+    const bool classAvailable = registeredByUs || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    HWND probeWindow = classAvailable
+                           ? CreateWindowW(className, className, WS_OVERLAPPEDWINDOW, 0, 0,
+                                           1, 1, nullptr, nullptr, wc.hInstance, nullptr)
+                           : nullptr;
+
+    IDirect3DDevice9 *device = nullptr;
+    HRESULT hr = TryCreateProbeDevice(d3d9, probeWindow, &device);
+    bool hooked = false;
+    if (SUCCEEDED(hr) && device) {
+        hooked = InstallDeviceHooks(device);
+        device->Release();
+    }
+
+    if (probeWindow) {
+        DestroyWindow(probeWindow);
+    }
+    if (registeredByUs) {
+        UnregisterClassW(className, wc.hInstance);
+    }
+    d3d9->Release();
+
+    return hooked;
+}
+
+static void StartFallbackProbe() {
+    std::lock_guard<std::recursive_mutex> lock(d3dHookMutex);
+    if (fallbackProbeStarted || renderHooksInstalled) {
+        return;
+    }
+
+    fallbackProbeStarted = true;
+    std::thread([]() {
+        Sleep(2000);
+        for (auto attempt = 0; attempt < 120; ++attempt) {
+            {
+                std::lock_guard<std::recursive_mutex> lock(d3dHookMutex);
+                if (renderHooksInstalled) {
+                    return;
+                }
+            }
+
+            if (TryFallbackProbe()) {
+                return;
+            }
+
+            Sleep(1000);
+        }
+    }).detach();
+}
+
+IDirect3D9 *WINAPI Direct3DCreate9Hook(UINT sdkVersion) {
+    IDirect3D9 *d3d9 = Direct3DCreate9Original(sdkVersion);
+    if (d3d9 && !d3dProbeSuppressed) {
+        InstallCreateDeviceHook(d3d9);
+    }
+
+    return d3d9;
+}
+
+HRESULT WINAPI CreateDeviceHook(IDirect3D9 *d3d9, UINT adapter, D3DDEVTYPE deviceType,
+                                HWND focusWindow, DWORD behaviorFlags,
+                                D3DPRESENT_PARAMETERS *presentationParameters,
+                                IDirect3DDevice9 **returnedDevice) {
+    const auto hr = CreateDeviceOriginal(d3d9, adapter, deviceType, focusWindow,
+                                         behaviorFlags, presentationParameters,
+                                         returnedDevice);
+    if (d3dProbeSuppressed) {
+        return hr;
+    }
+
+    if (SUCCEEDED(hr) && returnedDevice && *returnedDevice) {
+        InstallDeviceHooks(*returnedDevice);
+    }
+
+    return hr;
+}
+
+HMODULE WINAPI LoadLibraryAHook(const char *module) {
+    const bool menl = IsMenlModuleName(module);
+    if (menl) {
+        PrepareMenlHooksForLoad();
+    }
+
+    const auto result = LoadLibraryAOriginal(module);
+    if (result && IsD3D9ModuleName(module)) {
+        HandleLoadedModule(result);
+    }
+
+    return result;
+}
+
+HMODULE WINAPI LoadLibraryWHook(LPCWSTR module) {
+    const bool menl = IsMenlModuleName(module);
+    if (menl) {
+        PrepareMenlHooksForLoad();
+    }
+
+    const auto result = LoadLibraryWOriginal(module);
+    if (result && IsD3D9ModuleName(module)) {
+        HandleLoadedModule(result);
+    }
+
+    return result;
+}
+
+HMODULE WINAPI LoadLibraryExWHook(LPCWSTR module, HANDLE file, DWORD flags) {
+    const bool menl = IsMenlModuleName(module);
+    if (menl) {
+        PrepareMenlHooksForLoad();
+    }
+
+    const auto result = LoadLibraryExWOriginal(module, file, flags);
+    if (result && IsD3D9ModuleName(module)) {
+        HandleLoadedModule(result);
+    }
+
+    return result;
 }
 
 void *__fastcall ActorTickHook(Classes::AActor *actor, void *idle, void *arg) {
@@ -980,7 +1397,34 @@ void Engine::OnSuperInput(InputCallback callback) {
 }
 
 void Engine::BlockInput(bool block) {
-    ImGui::GetIO().MouseDrawCursor = window.BlockInput = block;
+    window.BlockInput = block;
+    if (renderScene.ImGuiInitialized && ImGui::GetCurrentContext()) {
+        ImGui::GetIO().MouseDrawCursor = block;
+    }
+}
+
+bool Engine::InitializeD3D() {
+    std::lock_guard<std::recursive_mutex> lock(d3dHookMutex);
+    if (!moduleHooksInstalled) {
+        moduleHooksInstalled =
+            Hook::TrampolineHook(LoadLibraryAHook, LoadLibraryA,
+                                 reinterpret_cast<void **>(&LoadLibraryAOriginal)) &&
+            Hook::TrampolineHook(LoadLibraryWHook, LoadLibraryW,
+                                 reinterpret_cast<void **>(&LoadLibraryWOriginal)) &&
+            Hook::TrampolineHook(LoadLibraryExWHook, LoadLibraryExW,
+                                 reinterpret_cast<void **>(&LoadLibraryExWOriginal));
+
+        if (!moduleHooksInstalled) {
+            return false;
+        }
+    }
+
+    const auto d3d9 = GetModuleHandleW(L"d3d9.dll");
+    if (d3d9) {
+        InstallD3DFactoryHook(d3d9);
+    }
+
+    return true;
 }
 
 bool Engine::Initialize() {
@@ -1011,82 +1455,11 @@ bool Engine::Initialize() {
         reinterpret_cast<decltype(Classes::UObject::GObjects)>(
             *reinterpret_cast<void **>(reinterpret_cast<byte *>(ptr) + 2));
 
-    // LoadLibraryA
-    Hook::TrampolineHook(LoadLibraryAHook, LoadLibraryA,
-                         reinterpret_cast<void **>(&LoadLibraryAOriginal));
-
-    // D3D9 init
-    auto d3d9 = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!d3d9) {
-        MessageBoxA(nullptr, "Direct3DCreate9 failed", "Failure", MB_ICONERROR);
-        return false;
-    }
-
-    D3DPRESENT_PARAMETERS d3dpp;
-    ZeroMemory(&d3dpp, sizeof(d3dpp));
-    d3dpp.Windowed = TRUE;
-    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    d3dpp.BackBufferFormat = D3DFMT_UNKNOWN;
-    
-    WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, DefWindowProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, TEXT("D3D fake window"), NULL };
-    RegisterClassEx(&wc);
-    HWND hWnd = CreateWindow(wc.lpszClassName, TEXT("D3D fake window"), WS_OVERLAPPEDWINDOW, 100, 100, 100, 100, NULL, NULL, wc.hInstance, NULL);
-
-    IDirect3DDevice9* dummyDevice = nullptr;
-    
-    // Fixes D3DERR_DEVICELOST - for DXVK / other wrappers.
-    d3dpp.hDeviceWindow = NULL;
-    HRESULT hr = d3d9->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, d3dpp.hDeviceWindow,
-        D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &dummyDevice);
-
-    // Fix for Reshade
-    if (FAILED(hr) || !dummyDevice) {
-        d3dpp.hDeviceWindow = hWnd;
-        hr = d3d9->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, d3dpp.hDeviceWindow,
-            D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &dummyDevice);
-    }
-
-    // Last resort - ref device
-    if (FAILED(hr) || !dummyDevice) {
-         d3dpp.hDeviceWindow = NULL;
-         hr = d3d9->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_REF, d3dpp.hDeviceWindow,
-            D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &dummyDevice);
-    }
-    
-    if (FAILED(hr) || !dummyDevice) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "CreateDevice failed. HRESULT: 0x%08lX", hr);
-        
-        DestroyWindow(hWnd);
-        UnregisterClass(wc.lpszClassName, wc.hInstance);
-        d3d9->Release();
-        MessageBoxA(nullptr, buf, "Failure", MB_ICONERROR);
-        return false;
-    }
-
-    void** vtable = *reinterpret_cast<void***>(dummyDevice);
-    
-    // EndScene
-    if (!Hook::TrampolineHook(
-            EndSceneHook, vtable[D3D9_EXPORT_ENDSCENE],
-            reinterpret_cast<void **>(&renderScene.Original))) {
-        MessageBoxA(nullptr, "Failed to hook D3D9 EndScene", "Failure", MB_ICONERROR);
-        return false;
-    }
-
-    // Reset
-    if (!Hook::TrampolineHook(
-            ResetHook, vtable[D3D9_EXPORT_RESET],
-            reinterpret_cast<void **>(&resetScene.Original))) {
-        MessageBoxA(nullptr, "Failed to hook D3D9 Reset", "Failure", MB_ICONERROR);
-        return false;
-    }
-
     // PeekMessage
     if (!Hook::TrampolineHook(PeekMessageHook, PeekMessageW,
                               reinterpret_cast<void **>(&window.PeekMessage))) {
 
-        MessageBoxA(nullptr, "Failed to hook D3D9 Reset", "Failure", MB_ICONERROR);
+        MessageBoxA(nullptr, "Failed to hook PeekMessageW", "Failure", MB_ICONERROR);
         return false;
     }
 
