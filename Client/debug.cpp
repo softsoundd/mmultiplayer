@@ -130,7 +130,7 @@ static long WINAPI ExceptionHandler(EXCEPTION_POINTERS *exception) {
     }
 
     printf("\nIf this was unexpected, please copy this output and create an "
-           "issue at:\n\thttps://github.com/LucasOe/mmultiplayer/issues\n\n");
+           "issue at:\n\thttps://github.com/softsoundd/mmultiplayer/issues\n\n");
 
     printf("Press any key to exit...");
     static_cast<void>(_getch());

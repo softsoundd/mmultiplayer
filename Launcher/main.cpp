@@ -8,7 +8,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, char *, int) {
     }
 
     const auto thread = CreateDialogThread();
-    for (;; Sleep(200)) {
+    for (;; Sleep(50)) {
         const auto processInfo = GetProcessInfoByName(L"MirrorsEdge.exe");
         if (!processInfo.th32ProcessID) {
             continue;
@@ -24,6 +24,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, char *, int) {
         if (HasModule(process, L"mmultiplayer.dll")) {
             CloseHandle(process);
             return 0;
+        }
+
+        if (!HasModule(process, L"d3d9.dll")) {
+            CloseHandle(process);
+            continue;
         }
 
         TerminateThread(thread, 0);

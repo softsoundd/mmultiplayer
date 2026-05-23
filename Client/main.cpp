@@ -27,6 +27,8 @@ DWORD WINAPI InitThread(LPVOID param) {
         goto CLEANUP;
     }
 
+    Debug::Initialize();
+
     if (!Menu::Initialize()) {
         MessageBoxA(nullptr, "Failed to initialize menu", "Fatal", 0);
         goto CLEANUP;
@@ -50,7 +52,6 @@ DWORD WINAPI InitThread(LPVOID param) {
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);
-        Debug::Initialize();
 
         CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     }
