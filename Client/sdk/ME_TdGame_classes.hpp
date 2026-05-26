@@ -1688,26 +1688,8 @@ public:
 	float                                              LastYAxisTilt;                                            // 0x0688(0x0004)
 	TArray<class USeqEvt_TdWeaponFired*>               WeaponFiredEvents;                                        // 0x068C(0x000C) (NeedCtorLink)
 	
-	static bool bNeedSofTimerCheck;
-
 	static UClass *StaticClass() {
 		static UClass *ptr = nullptr;
-		static bool bFoundSofTimer = false;
-
-		if (bFoundSofTimer) {
-			return ptr;
-		}
-
-		if (bNeedSofTimerCheck) {
-			auto sofPtr = UObject::FindClass("Class MirrorsEdgeTweaksScripts.SofTimerPlayerController");
-			if (sofPtr) {
-				ptr = sofPtr;
-				bFoundSofTimer = true;
-				return ptr;
-			}
-			bNeedSofTimerCheck = false;
-		}
-
 		if (!ptr) {
 			ptr = UObject::FindClass("Class TdGame.TdPlayerController");
 		}
