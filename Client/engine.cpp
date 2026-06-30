@@ -311,8 +311,12 @@ int __fastcall ProcessEventHook(Classes::UObject *object, void *idle,
     return sum == 0 ? processEvent.Original(object, function, args, result) : 0;
 }
 
+static void ResetSoftimerCheck();
+
 int __fastcall LevelLoadHook(void *this_, void *idle, void **levelInfo,
                              unsigned long long arg) {
+
+    ResetSoftimerCheck();
 
     const auto levelName = reinterpret_cast<const wchar_t *>(levelInfo[7]);
 
@@ -355,6 +359,29 @@ int PostDeathHook() {
     return ret;
 }
 
+static bool s_needSoftimerCheck = true;
+
+static Classes::UClass *GetSoftTimerPlayerControllerClass() {
+    static Classes::UClass *softimerClass = nullptr;
+
+    if (s_needSoftimerCheck && !softimerClass) {
+        softimerClass = Classes::UObject::FindClass(
+            "Class MirrorsEdgeTweaksScripts.SofTimerPlayerController");
+        s_needSoftimerCheck = false;
+    }
+
+    return softimerClass;
+}
+
+static void ResetSoftimerCheck() {
+    s_needSoftimerCheck = true;
+}
+
+static bool IsKnownSoftTimerController(Classes::AController *controller) {
+    auto softimerClass = GetSoftTimerPlayerControllerClass();
+    return softimerClass && controller->IsA(softimerClass);
+}
+
 static Classes::UClass *GetTdPlayerControllerClass() {
     static Classes::UClass *tdClass = nullptr;
     if (!tdClass) {
@@ -362,17 +389,6 @@ static Classes::UClass *GetTdPlayerControllerClass() {
     }
 
     return tdClass;
-}
-
-static bool IsKnownSoftTimerController(Classes::AController *controller) {
-    static Classes::UClass *softimerClass = nullptr;
-
-    if (!softimerClass) {
-        softimerClass = Classes::UObject::FindClass(
-            "Class MirrorsEdgeTweaksScripts.SofTimerPlayerController");
-    }
-
-    return softimerClass && controller->IsA(softimerClass);
 }
 
 static bool IsTdPlayerController(Classes::AController *controller) {
